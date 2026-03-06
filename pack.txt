@@ -1,0 +1,1 @@
+pyinstaller --onefile --console --name "HutchSion Book Tool"   --add-data "C:\Users\ASUS\AppData\Local\Programs\Python\Python38\Lib\site-packages\playwright;playwright"  --hidden-import playwright --hidden-import playwright.sync_api  --hidden-import playwright._impl  --hidden-import tkinter --hidden-import queue --hidden-import dataclasses main.py

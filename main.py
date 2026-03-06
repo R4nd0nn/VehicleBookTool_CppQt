@@ -1,5 +1,6 @@
 import sys
 import time
+import os
 import random
 from dataclasses import dataclass, field
 from typing import List, Dict
@@ -37,9 +38,21 @@ class PageController:
         self._init_browser()
 
     def _init_browser(self):
-        """初始化浏览器"""
+        """初始化浏览器，适配打包环境"""
+        # 重要：设置浏览器路径环境变量，确保能找到打包进去的浏览器
+        if getattr(sys, 'frozen', False):
+            # 如果是打包后的 exe 运行
+            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '0'  # 使用打包的浏览器
+            print("✅ 运行在打包环境中")
+
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=False)
+
+        # 最简启动
+        self.browser = self.playwright.chromium.launch(
+            headless=False
+        )
+
+        # 创建上下文
         self.context = self.browser.new_context()
         self.page = self.context.new_page()
         self.page.goto(self.url)
@@ -366,7 +379,7 @@ class BookingGUI:
     def __init__(self, root, page_ctrl):
         self.root = root
         self.page_ctrl = page_ctrl
-        self.root.title("Hutchison订票工具")
+        self.root.title("Hutchsion订票工具")
         self.root.geometry("900x750")
 
         self.hour_vars = []
@@ -377,7 +390,7 @@ class BookingGUI:
         """初始化GUI控件"""
         title_frame = ttk.Frame(self.root)
         title_frame.pack(pady=5, fill="x")
-        ttk.Label(title_frame, text="⚡ Hutchison订票工具 ⚡", font=("Arial", 14, "bold")).pack()
+        ttk.Label(title_frame, text="⚡ Hutchsion订票工具 ⚡", font=("Arial", 14, "bold")).pack()
 
         # 状态显示
         status_frame = ttk.Frame(self.root)
