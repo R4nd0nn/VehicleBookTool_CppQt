@@ -1,11 +1,12 @@
 import sys
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import List, Dict
 import tkinter as tk
 from tkinter import ttk, scrolledtext
+import threading
 
 # 兼容所有Playwright版本，仅保留核心功能
 from playwright.sync_api import sync_playwright
@@ -20,7 +21,8 @@ class BookingState:
     hour_values: List[int] = field(default_factory=lambda: [0] * 24)
     remaining_values: Dict[int, int] = field(default_factory=dict)
     refresh_seconds: float = 3.0  # 刷新周期，默认3秒
-    selected_date: str = ""  # 用户选择的日期，格式：YYYY-MM-DD
+    target_date: str = ""  # 用户选择的目标预定日期，格式：YYYY-MM-DD
+    scheduled_time: datetime = None  # 任务开始时间
 
 
 # 初始化全局状态
@@ -55,6 +57,36 @@ class PageController:
             return self.page
         except:
             return self.page
+
+    def click_search_button(self) -> bool:
+        """点击Search按钮"""
+        try:
+            current_page = self.get_current_page()
+
+            # 尝试多种可能的Search按钮选择器
+            search_selectors = [
+                "#Search",  # ID选择器
+                "input[value='Search']",  # value属性
+                "button:has-text('Search')",  # 文本内容
+                ".search-button",  # 类名
+                "input[type='submit'][value='Search']"  # 更精确的定位
+            ]
+
+            for selector in search_selectors:
+                search_btn = current_page.locator(selector)
+                if search_btn.count() > 0 and search_btn.first.is_visible():
+                    search_btn.first.scroll_into_view_if_needed()
+                    search_btn.first.click()
+                    print(f"✅ 点击Search按钮 (使用选择器: {selector})")
+                    time.sleep(2)  # 等待搜索完成
+                    return True
+
+            print("⚠️ 未找到Search按钮")
+            return False
+
+        except Exception as e:
+            print(f"❌ 点击Search按钮失败：{e}")
+            return False
 
     def select_date(self, target_date: str) -> bool:
         """
@@ -260,21 +292,63 @@ class BookingController:
         self.update_status = status_callback
         self.current_hour = 0
         self.round_count = 1
-        self.state = "IDLE"  # IDLE, RUNNING, PAUSED
-        self.date_str = ""  # 当前操作的日期
+        self.state = "IDLE"  # IDLE, RUNNING, PAUSED, WAITING_SCHEDULE
+        self.target_date = ""  # 目标预定日期
+        self.scheduled_time = None
+        self.root = None
 
-    def start(self, date_str: str):
-        """开始预定流程"""
-        if self.state != "IDLE":
-            return
+    def start_with_schedule(self, target_date: str, scheduled_time: datetime):
+        """设置定时启动"""
+        self.target_date = target_date
+        self.scheduled_time = scheduled_time
+        self.state = "WAITING_SCHEDULE"
 
-        self.date_str = date_str
-        self.log(f"📅 目标日期: {date_str}")
+        self.log(f"📅 目标预定日期: {target_date}")
 
-        # 先选择日期
-        self.log("🔄 正在选择日期...")
-        if not self.page_ctrl.select_date(date_str):
-            self.log("❌ 日期选择失败，请检查日期格式或手动选择")
+        # 计算等待时间
+        now = datetime.now()
+        if scheduled_time > now:
+            wait_seconds = (scheduled_time - now).total_seconds()
+            wait_minutes = int(wait_seconds // 60)
+            wait_seconds_remain = int(wait_seconds % 60)
+            self.log(f"⏰ 任务开始时间: {scheduled_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.log(f"⏳ 距离开始还有: {wait_minutes}分{wait_seconds_remain}秒")
+
+            # 启动定时器线程
+            timer_thread = threading.Thread(target=self._schedule_wait, args=(wait_seconds,))
+            timer_thread.daemon = True
+            timer_thread.start()
+        else:
+            self.log("⚠️ 任务开始时间已过，立即开始")
+            self.root.after(100, lambda: self._start_booking())
+
+    def _schedule_wait(self, wait_seconds):
+        """等待定时时间"""
+        time.sleep(wait_seconds)
+        if self.state == "WAITING_SCHEDULE":
+            self.log("⏰ 任务开始时间到，开始执行预定任务")
+            self.root.after(0, self._start_booking)
+
+    def _start_booking(self):
+
+        current_page = self.page_ctrl.get_current_page()
+        current_page.evaluate('''
+            if(document.getElementById("Search")) {
+                document.getElementById("Search").click();
+            } else {
+                document.querySelector("input[value='Search']").click();
+            }
+        ''')
+        self.log("点击Search按钮进入页面")
+        time.sleep(2)  # 等待Search结果加载
+
+        """开始预定流程的内部方法"""
+        # 先选择目标日期
+        self.log("🔄 正在选择目标日期...")
+        if not self.page_ctrl.select_date(self.target_date):
+            self.log("❌ 目标日期选择失败，请检查日期格式或手动选择")
+            self.state = "IDLE"
+            self.update_status(False, False)
             return
 
         # 初始化剩余数量
@@ -284,6 +358,8 @@ class BookingController:
 
         if total_needed == 0:
             self.log("⚠️ 没有需要预定的数量")
+            self.state = "IDLE"
+            self.update_status(False, False)
             return
 
         self.state = "RUNNING"
@@ -294,6 +370,14 @@ class BookingController:
 
         # 开始第一轮
         self.root.after(100, self._process_next)
+
+    def start(self, target_date: str):
+        """立即开始预定流程"""
+        if self.state != "IDLE":
+            return
+
+        self.target_date = target_date
+        self._start_booking()
 
     def pause(self):
         """暂停"""
@@ -312,6 +396,7 @@ class BookingController:
         self.state = "IDLE"
         self.current_hour = 0
         self.round_count = 1
+        self.scheduled_time = None
         global_state.remaining_values = {}
         self.log("🔄 已重置")
         self.update_status(False, False)
@@ -349,16 +434,16 @@ class BookingController:
 
         if remaining <= 0:
             self.current_hour += 1
-            self.root.after(100, self._process_next)
+            self._process_next()
             return
 
         try:
-            available = self.page_ctrl.get_available_value(hour, self.date_str)
+            available = self.page_ctrl.get_available_value(hour, self.target_date)
 
             if available <= 0:
                 self.log(f"⏭️ 小时{hour:02d}: 可用数量为0，跳过")
                 self.current_hour += 1
-                self.root.after(500, self._process_next)
+                self._process_next()
                 return
 
             # 本轮需要填写的数量
@@ -368,7 +453,7 @@ class BookingController:
                 self.log(f"小时{hour:02d}: 需要{remaining}，可用{available}，尝试预定{book_amount}")
 
                 # 选择数量并点击Book
-                success = self.page_ctrl.select_and_book(hour, self.date_str, book_amount)
+                success = self.page_ctrl.select_and_book(hour, self.target_date, book_amount)
 
                 if success:
                     # 提交成功后，从remaining_values中减去
@@ -384,7 +469,7 @@ class BookingController:
                     self.log(f"❌ 小时{hour:02d}: 预定失败")
 
             self.current_hour += 1
-            self.root.after(500, self._process_next)
+            self._process_next()
 
         except Exception as e:
             self.log(f"⚠️ 小时{hour:02d} 操作失败: {str(e)[:50]}")
@@ -396,9 +481,9 @@ class BookingController:
         total_remaining = sum(global_state.remaining_values.values())
         self.log(f"\n📊 第 {self.round_count} 轮完成，剩余总数量: {total_remaining}")
 
-        # 点击Refresh按钮刷新页面（使用日期参数）
-        self.log(f"🔄 点击Refresh按钮刷新页面 (refreshSlots_{self.date_str})...")
-        self.page_ctrl.click_refresh_button(self.date_str)
+        # 点击Refresh按钮刷新页面（使用目标日期参数）
+        self.log(f"🔄 点击Refresh按钮刷新页面 (refreshSlots_{self.target_date})...")
+        self.page_ctrl.click_refresh_button(self.target_date)
         self.log("✅ 页面刷新完成")
 
         # 重置小时计数器
@@ -408,7 +493,7 @@ class BookingController:
         if total_remaining > 0:
             self.log(f"\n{'=' * 50}")
             self.log(f"第 {self.round_count} 轮预定开始")
-            self.root.after(1000, self._process_next)
+            self.root.after(10, self._process_next)
         else:
             self.log("\n🎉 所有预定完成！")
             self.state = "IDLE"
@@ -421,7 +506,7 @@ class BookingGUI:
         self.root = root
         self.page_ctrl = page_ctrl
         self.root.title("Patrick 预定工具")
-        self.root.geometry("900x750")
+        self.root.geometry("900x800")
 
         self.hour_vars = []
         self.controller = None
@@ -439,29 +524,33 @@ class BookingGUI:
         self.page_status_var = tk.StringVar(value="页面状态: 检测中...")
         ttk.Label(status_frame, textvariable=self.page_status_var, foreground="blue").pack(side="left")
 
+        # 定时状态显示
+        self.schedule_status_var = tk.StringVar(value="")
+        ttk.Label(status_frame, textvariable=self.schedule_status_var, foreground="green").pack(side="right", padx=10)
+
         # 设置区域
-        settings_frame = ttk.LabelFrame(self.root, text="设置")
+        settings_frame = ttk.LabelFrame(self.root, text="预定设置")
         settings_frame.pack(pady=8, padx=20, fill="x")
 
-        # 日期选择
+        # 目标日期选择（要预定的日期）
         date_row = ttk.Frame(settings_frame)
         date_row.pack(pady=5, fill="x")
 
-        ttk.Label(date_row, text="目标日期：", width=10).pack(side="left", padx=5)
+        ttk.Label(date_row, text="目标日期：", width=12).pack(side="left", padx=5)
 
         # 获取当前日期作为默认值
         today = datetime.now().strftime("%Y-%m-%d")
-        self.date_var = tk.StringVar(value=today)
-        date_entry = ttk.Entry(date_row, textvariable=self.date_var, width=15)
+        self.target_date_var = tk.StringVar(value=today)
+        date_entry = ttk.Entry(date_row, textvariable=self.target_date_var, width=15)
         date_entry.pack(side="left", padx=5)
 
-        ttk.Label(date_row, text="格式：YYYY-MM-DD", foreground="blue").pack(side="left", padx=5)
+        ttk.Label(date_row, text="格式：YYYY-MM-DD (要预定的日期)", foreground="blue").pack(side="left", padx=5)
 
         # 刷新周期设置（用于Refresh按钮后的等待）
         refresh_row = ttk.Frame(settings_frame)
         refresh_row.pack(pady=5, fill="x")
 
-        ttk.Label(refresh_row, text="刷新周期：", width=10).pack(side="left", padx=5)
+        ttk.Label(refresh_row, text="刷新周期：", width=12).pack(side="left", padx=5)
 
         self.refresh_var = tk.StringVar(value="3.0")
         refresh_spinbox = ttk.Spinbox(
@@ -490,6 +579,61 @@ class BookingGUI:
                 global_state.refresh_seconds = 3.0
 
         self.refresh_var.trace_add("write", validate_refresh)
+
+        # 新增：任务开始时间设置
+        schedule_frame = ttk.LabelFrame(self.root, text="任务开始时间设置")
+        schedule_frame.pack(pady=8, padx=20, fill="x")
+
+        # 任务开始日期（可以是今天或未来某天）
+        start_date_row = ttk.Frame(schedule_frame)
+        start_date_row.pack(pady=5, fill="x")
+
+        ttk.Label(start_date_row, text="开始日期：", width=12).pack(side="left", padx=5)
+
+        # 获取当前日期作为默认值
+        self.start_date_var = tk.StringVar(value=today)
+        start_date_entry = ttk.Entry(start_date_row, textvariable=self.start_date_var, width=15)
+        start_date_entry.pack(side="left", padx=5)
+
+        ttk.Label(start_date_row, text="格式：YYYY-MM-DD (任务开始日期)", foreground="blue").pack(side="left", padx=5)
+
+        # 任务开始时间
+        start_time_row = ttk.Frame(schedule_frame)
+        start_time_row.pack(pady=5, fill="x")
+
+        ttk.Label(start_time_row, text="开始时间：", width=12).pack(side="left", padx=5)
+
+        # 获取当前时间
+        now = datetime.now()
+
+        # 小时选择
+        self.hour_var = tk.StringVar(value=f"{now.hour:02d}")
+        hour_spin = ttk.Spinbox(start_time_row, from_=0, to=23, textvariable=self.hour_var, width=4, format="%02.0f")
+        hour_spin.pack(side="left", padx=2)
+        ttk.Label(start_time_row, text="时").pack(side="left")
+
+        # 分钟选择
+        self.minute_var = tk.StringVar(value="00")
+        minute_spin = ttk.Spinbox(start_time_row, from_=0, to=59, textvariable=self.minute_var, width=4,
+                                  format="%02.0f")
+        minute_spin.pack(side="left", padx=2)
+        ttk.Label(start_time_row, text="分").pack(side="left")
+
+        # 秒选择
+        self.second_var = tk.StringVar(value="00")
+        second_spin = ttk.Spinbox(start_time_row, from_=0, to=59, textvariable=self.second_var, width=4,
+                                  format="%02.0f")
+        second_spin.pack(side="left", padx=2)
+        ttk.Label(start_time_row, text="秒").pack(side="left")
+
+        # 快速设置按钮
+        quick_time_frame = ttk.Frame(schedule_frame)
+        quick_time_frame.pack(pady=5)
+
+        ttk.Button(quick_time_frame, text="现在时间", command=self.set_current_time, width=10).pack(side="left", padx=5)
+        ttk.Button(quick_time_frame, text="5分钟后", command=self.set_5min_later, width=10).pack(side="left", padx=5)
+        ttk.Button(quick_time_frame, text="10分钟后", command=self.set_10min_later, width=10).pack(side="left", padx=5)
+        ttk.Button(quick_time_frame, text="30分钟后", command=self.set_30min_later, width=10).pack(side="left", padx=5)
 
         # 24小时输入框
         hour_frame = ttk.LabelFrame(self.root, text="24小时预定数量设置")
@@ -531,8 +675,11 @@ class BookingGUI:
         button_container = ttk.Frame(btn_frame)
         button_container.pack(pady=10)
 
-        self.start_btn = ttk.Button(button_container, text="▶ 开始预定", command=self.start_booking, width=10)
-        self.start_btn.pack(side="left", padx=5)
+        self.schedule_btn = ttk.Button(button_container, text="⏰ 定时启动", command=self.schedule_booking, width=10)
+        self.schedule_btn.pack(side="left", padx=5)
+
+        self.immediate_btn = ttk.Button(button_container, text="⚡ 立即开始", command=self.start_booking, width=8)
+        self.immediate_btn.pack(side="left", padx=5)
 
         self.pause_btn = ttk.Button(button_container, text="⏸️ 暂停", command=self.pause_booking, state="disabled",
                                     width=8)
@@ -567,6 +714,55 @@ class BookingGUI:
                                                   font=("Consolas", 9), wrap=tk.WORD)
         self.log_text.pack(fill="both", expand=1, padx=5, pady=5)
 
+    def set_current_time(self):
+        """设置为当前时间"""
+        now = datetime.now()
+        self.hour_var.set(f"{now.hour:02d}")
+        self.minute_var.set(f"{now.minute:02d}")
+        self.second_var.set(f"{now.second:02d}")
+
+    def set_5min_later(self):
+        """设置为5分钟后"""
+        later = datetime.now() + timedelta(minutes=5)
+        self.start_date_var.set(later.strftime("%Y-%m-%d"))
+        self.hour_var.set(f"{later.hour:02d}")
+        self.minute_var.set(f"{later.minute:02d}")
+        self.second_var.set(f"{later.second:02d}")
+
+    def set_10min_later(self):
+        """设置为10分钟后"""
+        later = datetime.now() + timedelta(minutes=10)
+        self.start_date_var.set(later.strftime("%Y-%m-%d"))
+        self.hour_var.set(f"{later.hour:02d}")
+        self.minute_var.set(f"{later.minute:02d}")
+        self.second_var.set(f"{later.second:02d}")
+
+    def set_30min_later(self):
+        """设置为30分钟后"""
+        later = datetime.now() + timedelta(minutes=30)
+        self.start_date_var.set(later.strftime("%Y-%m-%d"))
+        self.hour_var.set(f"{later.hour:02d}")
+        self.minute_var.set(f"{later.minute:02d}")
+        self.second_var.set(f"{later.second:02d}")
+
+    def get_scheduled_datetime(self):
+        """获取设置的定时开始时间"""
+        try:
+            # 使用任务开始日期
+            date_str = self.start_date_var.get().strip()
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+
+            # 获取时间
+            hour = int(self.hour_var.get())
+            minute = int(self.minute_var.get())
+            second = int(self.second_var.get())
+
+            # 组合成完整的datetime
+            return datetime(date_obj.year, date_obj.month, date_obj.day, hour, minute, second)
+        except ValueError as e:
+            self.add_log(f"❌ 任务开始时间格式错误: {e}")
+            return None
+
     def add_log(self, msg):
         """追加日志"""
         self.log_text.config(state="normal")
@@ -599,36 +795,45 @@ class BookingGUI:
     def update_buttons(self, is_running, is_paused):
         """更新按钮状态"""
         if is_running and not is_paused:
-            self.start_btn.config(state="disabled")
+            self.schedule_btn.config(state="disabled")
+            self.immediate_btn.config(state="disabled")
             self.pause_btn.config(state="normal")
             self.resume_btn.config(state="disabled")
             self.reset_btn.config(state="normal")
         elif is_running and is_paused:
-            self.start_btn.config(state="disabled")
+            self.schedule_btn.config(state="disabled")
+            self.immediate_btn.config(state="disabled")
             self.pause_btn.config(state="disabled")
             self.resume_btn.config(state="normal")
             self.reset_btn.config(state="normal")
         else:
-            self.start_btn.config(state="normal")
+            self.schedule_btn.config(state="normal")
+            self.immediate_btn.config(state="normal")
             self.pause_btn.config(state="disabled")
             self.resume_btn.config(state="disabled")
             self.reset_btn.config(state="normal")
+            self.schedule_status_var.set("")
 
-    def start_booking(self):
-        """开始预定"""
+    def schedule_booking(self):
+        """定时启动预定"""
         if sum(v.get() for v in self.hour_vars) == 0:
             self.add_log("⚠️ 请先设置需要预定的数量")
             return
 
-        # 验证日期格式
-        date_str = self.date_var.get().strip()
+        # 验证目标日期格式
+        target_date = self.target_date_var.get().strip()
         try:
-            datetime.strptime(date_str, "%Y-%m-%d")
+            datetime.strptime(target_date, "%Y-%m-%d")
         except:
-            self.add_log("❌ 日期格式错误，应为 YYYY-MM-DD")
+            self.add_log("❌ 目标日期格式错误，应为 YYYY-MM-DD")
             return
 
-        global_state.selected_date = date_str
+        # 获取任务开始时间
+        scheduled_time = self.get_scheduled_datetime()
+        if not scheduled_time:
+            return
+
+        global_state.target_date = target_date
 
         # 创建控制器
         self.controller = BookingController(
@@ -643,8 +848,46 @@ class BookingGUI:
         global_state.is_paused = False
         self.update_buttons(True, False)
 
-        self.controller.start(date_str)
-        self.add_log("🚀 启动预定流程")
+        # 更新定时状态显示
+        self.schedule_status_var.set(f"⏰ 任务开始: {scheduled_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        self.controller.start_with_schedule(target_date, scheduled_time)
+        self.add_log(f"🚀 定时任务已设置")
+        self.add_log(f"📅 目标预定日期: {target_date}")
+        self.add_log(f"⏰ 任务开始时间: {scheduled_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def start_booking(self):
+        """立即开始预定"""
+        if sum(v.get() for v in self.hour_vars) == 0:
+            self.add_log("⚠️ 请先设置需要预定的数量")
+            return
+
+        # 验证目标日期格式
+        target_date = self.target_date_var.get().strip()
+        try:
+            datetime.strptime(target_date, "%Y-%m-%d")
+        except:
+            self.add_log("❌ 目标日期格式错误，应为 YYYY-MM-DD")
+            return
+
+        global_state.target_date = target_date
+
+        # 创建控制器
+        self.controller = BookingController(
+            self.page_ctrl,
+            self.add_log,
+            self.update_buttons
+        )
+        # 绑定root以便使用after
+        self.controller.root = self.root
+
+        global_state.is_running = True
+        global_state.is_paused = False
+        self.update_buttons(True, False)
+
+        self.controller.start(target_date)
+        self.add_log("🚀 立即启动预定流程")
+        self.add_log(f"📅 目标预定日期: {target_date}")
 
     def pause_booking(self):
         """暂停预定"""
@@ -695,7 +938,7 @@ if __name__ == "__main__":
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     print("✅ GUI已启动，您现在可以手动进行页面跳转")
-    print("当回到预定页面后，设置日期和数量，点击'开始预定'即可开始")
+    print("当回到预定页面后，设置目标日期和任务开始时间，点击'定时启动'或'立即开始'即可开始")
 
 
     # 启动页面状态检查
