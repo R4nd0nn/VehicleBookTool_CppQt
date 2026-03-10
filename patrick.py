@@ -151,10 +151,10 @@ class PageController:
             print(f"❌ 读取小时{hour} Available失败：{e}")
             return 0
 
-    def select_and_book(self, hour: int, date_str: str, value: int) -> bool:
+    def select_and_book(self, hour: int, date_str: str, value: int) -> int:
         """
         选择数量并点击Book按钮
-        返回是否成功
+        返回实际成功预定的数量
         """
         try:
             current_page = self.get_current_page()
@@ -165,7 +165,7 @@ class PageController:
 
             if select_elem.count() == 0:
                 print(f"小时{hour}: 未找到下拉框 {select_id}")
-                return False
+                return 0
 
             # 获取最大可选值
             options = select_elem.locator("option")
@@ -180,7 +180,7 @@ class PageController:
                 value = max_value
 
             if value <= 0:
-                return False
+                return 0
 
             # 选择数量（这会触发Book按钮出现）
             select_elem.select_option(str(value))
@@ -188,27 +188,148 @@ class PageController:
             time.sleep(1)  # 等待Book按钮出现
 
             # 2. 找到并点击对应的Book按钮
-            # Book按钮在popup div中，需要根据hour定位
             pop_id = f"pop_{date_str}_{hour}"
             book_btn = current_page.locator(f"#{pop_id} input[value='Book']")
 
             if book_btn.count() == 0:
-                # 尝试其他选择器
                 book_btn = current_page.locator(f"#btnBook_{date_str}_{hour}")
 
             if book_btn.count() > 0 and book_btn.first.is_visible():
                 book_btn.first.scroll_into_view_if_needed()
                 book_btn.first.click()
                 print(f"✅ 小时{hour}: 点击Book按钮")
-                time.sleep(2)  # 等待提交完成
-                return True
+                time.sleep(2)  # 等待弹窗出现
+
+                # 3. 检查预定结果弹窗
+                successful_bookings = self.check_booking_result()
+                print(f"📊 小时{hour}: 成功预定 {successful_bookings} 个名额")
+
+                return successful_bookings
             else:
                 print(f"⚠️ 小时{hour}: 未找到Book按钮")
-                return False
+                return 0
 
         except Exception as e:
             print(f"❌ 小时{hour} 操作失败：{e}")
-            return False
+            return 0
+
+    def check_booking_result(self) -> int:
+        """
+        检查预定结果弹窗，返回成功预定的数量
+        """
+        try:
+            current_page = self.get_current_page()
+
+            # 等待弹窗加载
+            time.sleep(1)
+
+            # 查找预定结果元素
+            # 方法1: 通过包含"Booked"文本的元素查找
+            booked_elem = current_page.locator("div.heading3_black:has-text('Booked')")
+
+            if booked_elem.count() > 0:
+                booked_text = booked_elem.first.inner_text()
+                print(f"找到预定结果文本: {booked_text}")
+
+                # 解析文本，例如 "Booked 1 Slots"
+                import re
+                match = re.search(r'Booked\s+(\d+)\s+Slots?', booked_text)
+                if match:
+                    return int(match.group(1))
+
+            # 方法2: 通过更具体的选择器查找
+            success_span = current_page.locator("#BookingsResult___SUCCESS_BOOKING")
+            if success_span.count() > 0:
+                inner_html = success_span.first.inner_html()
+                match = re.search(r'Booked\s+(\d+)\s+Slots?', inner_html)
+                if match:
+                    return int(match.group(1))
+
+            # 检查是否失败（失败元素可见）
+            failed_span = current_page.locator("#BookingsResult___FAILED_BOOKING")
+            if failed_span.count() > 0 and failed_span.first.is_visible():
+                print("⚠️ 预定失败")
+                return 0
+
+            print("⚠️ 未找到预定结果信息")
+            return 0
+
+        except Exception as e:
+            print(f"❌ 检查预定结果失败：{e}")
+            return 0
+
+    def handle_booking_result_popup(self, hour: int, date_str: str, attempted: int, successful: int) -> str:
+        """
+        处理预定结果弹窗，返回下一步操作
+        'continue' - 继续预定当前小时
+        'summary' - 完成当前小时
+        'error' - 出现错误
+        """
+        try:
+            current_page = self.get_current_page()
+
+            if successful == attempted:
+                # 全部成功
+                print(f"✅ 小时{hour}: 全部预定成功 ({successful}/{attempted})")
+
+                # 检查是否还有Continue按钮（可能还有更多名额）
+                continue_btn = current_page.locator("#Continue")
+                if continue_btn.count() > 0 and continue_btn.first.is_visible():
+                    # 还有继续按钮，说明可以继续预定
+                    return 'continue'
+                else:
+                    # 没有Continue按钮，点击Summary完成
+                    summary_btn = current_page.locator("#Summary")
+                    if summary_btn.count() > 0 and summary_btn.first.is_visible():
+                        summary_btn.first.click()
+                        print("✅ 点击Summary按钮")
+                        time.sleep(1.5)
+                        return 'summary'
+
+            elif successful > 0 and successful < attempted:
+                # 部分成功
+                print(f"⚠️ 小时{hour}: 部分成功 ({successful}/{attempted})")
+
+                # 点击Continue booking继续预定剩余名额
+                continue_btn = current_page.locator("#Continue")
+                if continue_btn.count() > 0 and continue_btn.first.is_visible():
+                    continue_btn.first.click()
+                    print("✅ 点击Continue booking按钮，继续预定剩余名额")
+                    time.sleep(1.5)
+                    return 'continue'
+                else:
+                    # 如果没有Continue按钮，可能是弹窗状态异常，尝试点击Summary
+                    summary_btn = current_page.locator("#Summary")
+                    if summary_btn.count() > 0 and summary_btn.first.is_visible():
+                        summary_btn.first.click()
+                        print("✅ 点击Summary按钮")
+                        time.sleep(1.5)
+                        return 'summary'
+
+            else:  # successful == 0
+                # 完全失败
+                print(f"❌ 小时{hour}: 完全失败")
+
+                # 尝试关闭弹窗
+                continue_btn = current_page.locator("#Continue")
+                if continue_btn.count() > 0 and continue_btn.first.is_visible():
+                    continue_btn.first.click()
+                    print("✅ 点击Continue按钮关闭失败弹窗")
+                    time.sleep(1.5)
+                    return 'continue'
+
+                summary_btn = current_page.locator("#Summary")
+                if summary_btn.count() > 0 and summary_btn.first.is_visible():
+                    summary_btn.first.click()
+                    print("✅ 点击Summary按钮关闭失败弹窗")
+                    time.sleep(1.5)
+                    return 'summary'
+
+            return 'error'
+
+        except Exception as e:
+            print(f"❌ 处理弹窗失败：{e}")
+            return 'error'
 
     def click_continue_button(self) -> bool:
         """
@@ -447,32 +568,40 @@ class BookingController:
                 return
 
             # 本轮需要填写的数量
-            book_amount = min(remaining, available)  # 不能超过可用数量
+            book_amount = min(remaining, available)
 
-            if book_amount > 0:
-                self.log(f"小时{hour:02d}: 需要{remaining}，可用{available}，尝试预定{book_amount}")
+            self.log(f"小时{hour:02d}: 需要{remaining}，可用{available}，尝试预定{book_amount}")
 
-                # 选择数量并点击Book
-                success = self.page_ctrl.select_and_book(hour, self.target_date, book_amount)
+            # 选择数量并点击Book，获取实际成功数量
+            success_count = self.page_ctrl.select_and_book(hour, self.target_date, book_amount)
 
-                if success:
-                    # 提交成功后，从remaining_values中减去
-                    global_state.remaining_values[hour] -= book_amount
-                    self.log(f"✅ 小时{hour:02d}: 成功预定{book_amount}，还剩{global_state.remaining_values[hour]}")
+            # 更新剩余数量（减去实际成功的数量）
+            global_state.remaining_values[hour] -= success_count
+            remaining = global_state.remaining_values[hour]
 
-                    # 点击Continue按钮返回主页面
-                    self.log("🔄 点击Continue返回...")
-                    self.page_ctrl.click_continue_button()
+            if success_count > 0:
+                self.log(f"✅ 小时{hour:02d}: 成功预定{success_count}，还剩{remaining}")
+            else:
+                self.log(f"❌ 小时{hour:02d}: 预定失败，仍需要{remaining}")
 
-                    time.sleep(1)  # 等待返回
-                else:
-                    self.log(f"❌ 小时{hour:02d}: 预定失败")
+            # 处理弹窗，返回主页面
+            self.log("🔄 返回主页面...")
+            self.page_ctrl.click_continue_button()
+            time.sleep(1)
 
+            # 无论成功与否，都移动到下个小时
             self.current_hour += 1
             self._process_next()
 
         except Exception as e:
             self.log(f"⚠️ 小时{hour:02d} 操作失败: {str(e)[:50]}")
+
+            # 尝试返回主页面
+            try:
+                self.page_ctrl.click_continue_button()
+            except:
+                pass
+
             self.current_hour += 1
             self.root.after(2000, self._process_next)
 
@@ -481,23 +610,25 @@ class BookingController:
         total_remaining = sum(global_state.remaining_values.values())
         self.log(f"\n📊 第 {self.round_count} 轮完成，剩余总数量: {total_remaining}")
 
+        # 检查是否所有需求都已满足
+        if total_remaining == 0:
+            self.log("\n🎉 所有预定完成！")
+            self.state = "IDLE"
+            self.update_status(False, False)
+            return
+
         # 点击Refresh按钮刷新页面（使用目标日期参数）
         self.log(f"🔄 点击Refresh按钮刷新页面 (refreshSlots_{self.target_date})...")
         self.page_ctrl.click_refresh_button(self.target_date)
         self.log("✅ 页面刷新完成")
 
-        # 重置小时计数器
+        # 重置小时计数器，开始新一轮
         self.current_hour = 0
         self.round_count += 1
 
-        if total_remaining > 0:
-            self.log(f"\n{'=' * 50}")
-            self.log(f"第 {self.round_count} 轮预定开始")
-            self.root.after(10, self._process_next)
-        else:
-            self.log("\n🎉 所有预定完成！")
-            self.state = "IDLE"
-            self.update_status(False, False)
+        self.log(f"\n{'=' * 50}")
+        self.log(f"第 {self.round_count} 轮预定开始（剩余 {total_remaining} 个名额待预定）")
+        self.root.after(10, self._process_next)
 
 
 # ===================== Tkinter GUI =====================

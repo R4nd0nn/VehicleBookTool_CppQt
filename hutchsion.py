@@ -118,8 +118,8 @@ class PageController:
             print(f"❌ 填充小时{hour} Request失败：{e}")
             return False
 
-    def click_submit_button(self) -> bool:
-        """点击提交按钮并确认"""
+    def click_submit_button_simple(self) -> bool:
+        """简单的点击提交按钮，不检查状态"""
         try:
             current_page = self.get_current_page()
             time.sleep(1)
@@ -293,9 +293,8 @@ class BookingController:
 
         # 检查是否所有需求都已满足
         if sum(global_state.remaining_values.values()) == 0:
-            self.log("\n🎉 所有预定完成！")
-            self.state = "IDLE"
-            self.update_status(False, False)
+            self.log("\n🎉 所有预定已提交，开始最终状态检查...")
+            self._final_check_and_retry()
             return
 
         # 如果当前小时已经处理完所有小时，提交本轮
@@ -364,23 +363,42 @@ class BookingController:
         if self.round_filled > 0:
             self.log(f"\n📤 本轮填写总数: {self.round_filled}，点击提交按钮...")
             try:
-                if self.page_ctrl.click_submit_button():
-                    self.log("✅ 提交成功")
+                # 保存本轮提交的小时信息，用于后续检查
+                current_round_hours = list(self.round_requests.keys())
+                current_round_amounts = self.round_requests.copy()
 
-                    # 提交成功后，才从remaining_values中减去本轮填写的数量
-                    for hour, amount in self.round_requests.items():
-                        global_state.remaining_values[hour] -= amount
-                        self.log(f"📝 小时{hour:02d}: 已扣除{amount}，剩余{global_state.remaining_values[hour]}")
-
-                    self.log("🔄 正在刷新页面...")
-                    # 使用用户设置的刷新周期
-                    self.page_ctrl.reload_page(global_state.refresh_seconds)
-                    self.log("✅ 页面刷新完成")
-                else:
-                    self.log("⚠️ 提交可能失败，本轮填写可能未生效")
-                    # 提交失败，不清除round_requests，下一轮可以重试
+                # 点击提交按钮（不检查状态）
+                if not self.page_ctrl.click_submit_button_simple():
+                    self.log("⚠️ 提交可能失败")
                     self.root.after(3000, self._prepare_next_round)
                     return
+
+                # 提交成功后，从remaining_values中减去本轮填写的数量
+                for hour, amount in self.round_requests.items():
+                    global_state.remaining_values[hour] -= amount
+                    self.log(f"📝 小时{hour:02d}: 已扣除{amount}，剩余{global_state.remaining_values[hour]}")
+
+                # 检查是否所有任务都完成了
+                total_remaining = sum(global_state.remaining_values.values())
+
+                if total_remaining == 0:
+                    # 所有预定都提交完了，进行最终状态检查
+                    self.log("\n🎉 所有预定已提交，开始最终状态检查...")
+                    self._final_check_and_retry()
+                    return
+                else:
+                    # 还有剩余任务，继续下一轮
+                    self.log(f"📊 本轮完成，剩余 {total_remaining} 个需要预定")
+                    self.current_hour = 0
+                    self.round_requests = {}
+                    self.round_filled = 0
+                    self.round_count += 1
+
+                    self.log(f"\n{'=' * 50}")
+                    self.log(f"第 {self.round_count} 轮预定开始")
+                    self.root.after(1000, self._process_next)
+                    return
+
             except Exception as e:
                 self.log(f"⚠️ 提交出错: {str(e)[:50]}")
                 self.root.after(3000, self._prepare_next_round)
@@ -388,7 +406,6 @@ class BookingController:
         else:
             self.log("⚠️ 本轮没有可预定的数量，刷新页面后重试...")
             self.log("🔄 正在刷新页面...")
-            # 使用用户设置的刷新周期
             self.page_ctrl.reload_page(global_state.refresh_seconds)
             self.log("✅ 页面刷新完成")
 
@@ -414,6 +431,139 @@ class BookingController:
             self.log("\n🎉 所有预定完成！")
             self.state = "IDLE"
             self.update_status(False, False)
+
+    def _final_check_and_retry(self):
+        """
+        所有预定完成后，统一检查本次预定的状态
+        如果全部成功则结束，如果有被拒绝的则重试
+        """
+
+        # 跳转到预订仪表盘页面
+        self.log("📋 跳转到预订仪表盘页面检查状态...")
+        self.page_ctrl.page.goto("https://hpaportal.com.au/HPAPB/TAS/Appointments/BookingDashboard")
+        time.sleep(3)
+
+        retry_count = 0
+        max_retry = 30  # 最多检查30次（约1分钟）
+
+        while retry_count < max_retry:
+            retry_count += 1
+            self.log(f"\n📊 第 {retry_count} 次状态检查...")
+
+            try:
+                current_page = self.page_ctrl.get_current_page()
+
+                # 刷新页面获取最新状态
+                current_page.reload()
+                time.sleep(2)
+
+                # 查找所有状态行
+                status_spans = current_page.locator("td:nth-child(6) span")
+                count = status_spans.count()
+
+                if count == 0:
+                    self.log("⚠️ 未找到任何预定记录")
+                    time.sleep(2)
+                    continue
+
+                has_pending = False
+                rejected_hours = []
+
+                # 只检查本轮提交的记录（根据当前round_requests中的小时）
+                for i in range(count):
+                    span = status_spans.nth(i)
+                    class_name = span.get_attribute("class")
+                    text = span.inner_text().strip()
+
+                    # 获取这条记录的小时
+                    hour = self._get_hour_from_record(i)
+                    if hour is None or hour not in self.round_requests:
+                        continue  # 不是本次预定的记录，跳过
+
+                    if class_name and "Processed" in class_name:
+                        self.log(f"✅ 小时{hour:02d}: Processed - 成功")
+                    elif class_name and "Rejected" in class_name:
+                        self.log(f"❌ 小时{hour:02d}: Rejected - 被拒绝")
+                        rejected_hours.append(hour)
+                    elif class_name and "Pending" in class_name:
+                        self.log(f"⏳ 小时{hour:02d}: Pending - 处理中")
+                        has_pending = True
+                    else:
+                        self.log(f"⚠️ 小时{hour:02d}: 未知状态 - {text}")
+
+                if has_pending:
+                    self.log("⏳ 还有预定在处理中，2秒后刷新重试...")
+                    time.sleep(2)
+                    continue
+                else:
+                    # 所有状态都已确定
+                    if rejected_hours:
+                        self.log(f"🔄 发现 {len(rejected_hours)} 个被拒绝的小时")
+
+                        # 将被拒绝的小时重新加入待预定列表
+                        for hour in rejected_hours:
+                            if hour in global_state.remaining_values:
+                                global_state.remaining_values[hour] += self.round_requests.get(hour, 0)
+                                self.log(
+                                    f"📝 小时{hour:02d}: 被拒绝，增加待预定数量，现在需要 {global_state.remaining_values[hour]}")
+                            else:
+                                global_state.remaining_values[hour] = self.round_requests.get(hour, 0)
+                                self.log(
+                                    f"📝 小时{hour:02d}: 被拒绝，新增待预定，需要 {global_state.remaining_values[hour]}")
+
+                        # 跳转回预定页面准备重试
+                        self.log("🔄 跳转回预定页面准备重试被拒绝的时段...")
+                        self.page_ctrl.page.goto("https://hpaportal.com.au/HPAPB/TAS/Appointments/Book")
+                        time.sleep(2)
+
+                        # 重置状态开始重试
+                        self.current_hour = 0
+                        self.round_requests = {}
+                        self.round_filled = 0
+                        self.round_count += 1
+
+                        self.log(f"\n{'=' * 50}")
+                        self.log(f"第 {self.round_count} 轮重试被拒绝的时段")
+                        self.root.after(1000, self._process_next)
+                        return
+                    else:
+                        self.log("✅ 所有预定成功！")
+                        self.state = "IDLE"
+                        self.update_status(False, False)
+                        return
+
+            except Exception as e:
+                self.log(f"❌ 检查状态失败：{e}")
+                time.sleep(2)
+                continue
+
+        self.log("⚠️ 状态检查超时，请手动确认")
+        self.state = "IDLE"
+        self.update_status(False, False)
+
+    def _get_hour_from_record(self, index: int):
+        """从记录中提取小时信息"""
+        try:
+            current_page = self.page_ctrl.get_current_page()
+
+            # 获取开始时间列（第2列）
+            time_cells = current_page.locator("td:nth-child(2)")
+            if index < time_cells.count():
+                time_text = time_cells.nth(index).inner_text().strip()
+                # 解析时间文本，格式如 "11/03/2026 23:00"
+                # 可能是多行文本，需要处理
+                lines = time_text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line and ':' in line:
+                        try:
+                            hour = int(line.split(':')[0])
+                            return hour
+                        except:
+                            continue
+        except Exception as e:
+            print(f"提取小时失败: {e}")
+        return None
 
 
 # ===================== Tkinter GUI =====================
