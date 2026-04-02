@@ -101,6 +101,7 @@ class PageController:
             target_str = target.strftime("%a %d/%m")  # 例如 "Fri 06/03"
 
             # 查找日历中的日期元素
+            current_page.wait_for_selector(".calendarbar-day:visible", timeout=5000)
             date_elements = current_page.locator(".calendarbar-day")
             count = date_elements.count()
 
@@ -185,7 +186,6 @@ class PageController:
             # 选择数量（这会触发Book按钮出现）
             select_elem.select_option(str(value))
             print(f"✅ 小时{hour}: 选择数量 {value}")
-            time.sleep(1)  # 等待Book按钮出现
 
             # 2. 找到并点击对应的Book按钮
             pop_id = f"pop_{date_str}_{hour}"
@@ -197,8 +197,8 @@ class PageController:
             if book_btn.count() > 0 and book_btn.first.is_visible():
                 book_btn.first.scroll_into_view_if_needed()
                 book_btn.first.click()
-                print(f"✅ 小时{hour}: 点击Book按钮")
-                time.sleep(2)  # 等待弹窗出现
+                print(f"✅ 小时{hour}: 点击Book按钮, 当前精确时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+                time.sleep(1)  # 等待弹窗出现
 
                 # 3. 检查预定结果弹窗
                 successful_bookings = self.check_booking_result()
@@ -570,7 +570,7 @@ class BookingController:
             # 本轮需要填写的数量
             book_amount = min(remaining, available)
 
-            self.log(f"小时{hour:02d}: 需要{remaining}，可用{available}，尝试预定{book_amount}")
+            self.log(f"小时{hour:02d}: 需要{remaining}，可用{available}，尝试预定{book_amount}，当前精确时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
 
             # 选择数量并点击Book，获取实际成功数量
             success_count = self.page_ctrl.select_and_book(hour, self.target_date, book_amount)
@@ -683,12 +683,12 @@ class BookingGUI:
 
         ttk.Label(refresh_row, text="刷新周期：", width=12).pack(side="left", padx=5)
 
-        self.refresh_var = tk.StringVar(value="3.0")
+        self.refresh_var = tk.StringVar(value="0.0")
         refresh_spinbox = ttk.Spinbox(
             refresh_row,
-            from_=0.5,
+            from_=0.0,
             to=30.0,
-            increment=0.5,
+            increment=0.1,
             textvariable=self.refresh_var,
             width=10
         )
