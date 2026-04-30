@@ -1,8 +1,9 @@
 """
-Hutchinson Ports 自动预约系统 - 完整版 v5
+Hutchinson Ports 自动预约系统 - 完整版 v7
 - 并发查询 Available 值
-- 每轮提交后立即校验，只扣除成功的小时
-- 失败的小时自动加入下一轮重试
+- 每轮提交后立即校验，根据 Dashboard 状态判断成功数量
+- Pending 状态每3秒刷新等待，超时停止任务
+- 成功的小时自动扣除，失败的小时自动加入下一轮重试
 - 控制台输出每轮信息，界面显示成功预约
 """
 
@@ -64,13 +65,13 @@ class ControlPanel:
         tk.Label(row1, text="预约类型:", bg='#1e1e2f', fg='white', width=10).pack(side=tk.LEFT)
         self.req_type_var = tk.StringVar(value="IMPORT")
         type_menu = ttk.Combobox(row1, textvariable=self.req_type_var,
-                                 values=["IMPORT", "EXPORT"], width=12)
+                                  values=["IMPORT", "EXPORT"], width=12)
         type_menu.pack(side=tk.LEFT, padx=5)
 
         tk.Label(row1, text="轮次间隔(秒):", bg='#1e1e2f', fg='white', width=12).pack(side=tk.LEFT, padx=(20, 0))
         self.interval_var = tk.StringVar(value="1.0")
         interval_entry = tk.Entry(row1, textvariable=self.interval_var, width=8,
-                                  bg='#2d2d3f', fg='white')
+                                   bg='#2d2d3f', fg='white')
         interval_entry.pack(side=tk.LEFT, padx=5)
 
         row2 = tk.Frame(config_frame, bg='#1e1e2f')
@@ -82,24 +83,24 @@ class ControlPanel:
         time_frame.pack(side=tk.LEFT, padx=5)
 
         self.schedule_hour = tk.Spinbox(time_frame, from_=0, to=23, width=3,
-                                        format="%02.0f", bg='#2d2d3f', fg='white')
+                                         format="%02.0f", bg='#2d2d3f', fg='white')
         self.schedule_hour.pack(side=tk.LEFT)
         tk.Label(time_frame, text=":", bg='#1e1e2f', fg='white').pack(side=tk.LEFT)
         self.schedule_minute = tk.Spinbox(time_frame, from_=0, to=59, width=3,
-                                          format="%02.0f", bg='#2d2d3f', fg='white')
+                                           format="%02.0f", bg='#2d2d3f', fg='white')
         self.schedule_minute.pack(side=tk.LEFT)
         tk.Label(time_frame, text=":", bg='#1e1e2f', fg='white').pack(side=tk.LEFT)
         self.schedule_second = tk.Spinbox(time_frame, from_=0, to=59, width=3,
-                                          format="%02.0f", bg='#2d2d3f', fg='white')
+                                           format="%02.0f", bg='#2d2d3f', fg='white')
         self.schedule_second.pack(side=tk.LEFT)
 
         self.schedule_date_var = tk.StringVar(value="今天")
         date_menu = ttk.Combobox(time_frame, textvariable=self.schedule_date_var,
-                                 values=["今天", "明天"], width=6)
+                                   values=["今天", "明天"], width=6)
         date_menu.pack(side=tk.LEFT, padx=5)
 
         self.schedule_btn = tk.Button(row2, text="设置定时", command=self.set_schedule,
-                                      bg='#2196f3', fg='white', font=("微软雅黑", 9), width=8)
+                                       bg='#2196f3', fg='white', font=("微软雅黑", 9), width=8)
         self.schedule_btn.pack(side=tk.LEFT, padx=10)
 
         self.schedule_status = tk.Label(row2, text="", bg='#1e1e2f', fg='#ff9800', font=("微软雅黑", 8))
@@ -113,7 +114,7 @@ class ControlPanel:
         self.start_btn.pack(side=tk.LEFT, padx=5)
 
         self.stop_btn = tk.Button(btn_frame, text="停止", command=self.stop_clicked,
-                                  bg='#f44336', fg='white', font=("微软雅黑", 10), width=10, state=tk.DISABLED)
+                                   bg='#f44336', fg='white', font=("微软雅黑", 10), width=10, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
         self.reset_btn = tk.Button(btn_frame, text="重置", command=self.reset_clicked,
@@ -203,7 +204,7 @@ class ControlPanel:
         if self._scheduled_time and now < self._scheduled_time:
             delay_ms = int((self._scheduled_time - now).total_seconds() * 1000)
             self._schedule_timer = self.root.after(delay_ms, self._on_schedule_timeout)
-            self.log_system(f"⏰ 定时器已启动，将在 {delay_ms // 1000} 秒后执行")
+            self.log_system(f"⏰ 定时器已启动，将在 {delay_ms//1000} 秒后执行")
 
     def _on_schedule_timeout(self):
         self.log_system("⏰ 定时时间到，自动开始预约")
@@ -233,6 +234,12 @@ class ControlPanel:
             self.log_system("⚠️ 没有需要预约的数量")
             return
 
+        # 清除定时时间，避免影响立即开始
+        self._scheduled_time = None
+        if self._schedule_timer:
+            self.root.after_cancel(self._schedule_timer)
+            self._schedule_timer = None
+
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.schedule_btn.config(state=tk.DISABLED)
@@ -258,8 +265,11 @@ class ControlPanel:
         self.schedule_btn.config(state=tk.NORMAL)
         self.update_status("⚪ 空闲")
         self.schedule_status.config(text="")
+        # 清除定时
+        self._scheduled_time = None
         if self._schedule_timer:
             self.root.after_cancel(self._schedule_timer)
+            self._schedule_timer = None
 
     def update_status(self, status: str):
         self.status_var.set(status)
@@ -310,10 +320,8 @@ class BookingController:
         self.state.is_running = True
         self._stop_flag = False
 
-        self.log_system_gui(
-            f"📊 类型: {self.state.req_type}, 间隔: {self.state.refresh_interval}秒, 总需求: {self.total_needed}")
-        self.log_console(
-            f"📊 类型: {self.state.req_type}, 间隔: {self.state.refresh_interval}秒, 总需求: {self.total_needed}")
+        self.log_system_gui(f"📊 类型: {self.state.req_type}, 间隔: {self.state.refresh_interval}秒, 总需求: {self.total_needed}")
+        self.log_console(f"📊 类型: {self.state.req_type}, 间隔: {self.state.refresh_interval}秒, 总需求: {self.total_needed}")
 
         await self._run_booking()
 
@@ -341,13 +349,13 @@ class BookingController:
             return False
 
     async def _get_available_value(self, hour: int) -> int:
-        """读取 Available 值 - 第2列是Import，第5列是Export"""
+        """读取 Available 值 - Import在第2列，Export在第5列"""
         try:
-            row_index = hour + 1
+            row_index = hour % 12 + 1
             if self.state.req_type == "IMPORT":
-                col_index = 2  # Import Available 在第2列
+                col_index = 3
             else:
-                col_index = 5  # Export Available 在第5列
+                col_index = 6
 
             panel_class = "left-panel" if hour < 12 else "right-panel"
             selector = f".{panel_class} table tbody tr:nth-child({row_index}) td:nth-child({col_index})"
@@ -383,76 +391,103 @@ class BookingController:
         except:
             return False
 
-    async def _verify_round_submission(self, round_requests: Dict[int, int]) -> Dict[int, int]:
-        """
-        校验本轮提交，返回实际成功的小时和数量
-        例如：round_requests = {1:1, 2:1, 3:1}
-        如果小时1成功，小时2成功，小时3失败
-        返回 {1:1, 2:1}
-        """
-        await self.page.goto("https://hpaportal.com.au/HPAPB/TAS/Appointments/BookingDashboard")
-        await asyncio.sleep(1.5)
-        await self.page.reload()
-        await asyncio.sleep(0.5)
-
-        success_hours = {}
-
-        for hour, requested in round_requests.items():
-            try:
-                rows = await self.page.query_selector_all('tbody tr')
-                found = False
-
-                for row in rows:
-                    hour_cell = await row.query_selector('td:nth-child(2)')
-                    if hour_cell:
-                        hour_text = await hour_cell.inner_text()
-                        # 解析小时，格式如 "20:00 - 21:00" 或 "20"
-                        match = re.search(r'(\d+):', hour_text)
-                        if match:
-                            row_hour = int(match.group(1))
-                        else:
-                            match = re.search(r'(\d+)', hour_text)
-                            if match:
-                                row_hour = int(match.group(1))
-                            else:
-                                continue
-
-                        if row_hour == hour:
-                            found = True
-                            # Request 在第3列，Booked 在第4列
-                            req_cell = await row.query_selector('td:nth-child(3) span')
-                            book_cell = await row.query_selector('td:nth-child(4) span')
-
-                            req_text = await req_cell.inner_text() if req_cell else "0"
-                            book_text = await book_cell.inner_text() if book_cell else "0"
-
-                            req_val = int(req_text.strip() or 0)
-                            book_val = int(book_text.strip() or 0)
-
-                            if book_val >= requested:
-                                success_hours[hour] = requested
-                                self.log_console(f"✅ 小时{hour:02d}: 成功预定{requested}个")
-                            elif book_val > 0:
-                                success_hours[hour] = book_val
-                                self.log_console(f"⚠️ 小时{hour:02d}: 部分成功，预定{book_val}/{requested}个")
-                            else:
-                                self.log_console(f"❌ 小时{hour:02d}: 预定失败")
-                            break
-
-                if not found:
-                    self.log_console(f"❌ 小时{hour:02d}: 未找到记录，预定失败")
-
-            except Exception as e:
-                self.log_console(f"❌ 校验小时{hour:02d}失败: {e}")
-
-        return success_hours
-
     async def _refresh_page(self):
         try:
             await self.page.reload()
             await asyncio.sleep(0.05)
         except:
             pass
+
+    async def _verify_round_submission(self, round_requests: Dict[int, int]) -> Dict[int, int]:
+        """
+        校验本轮提交，返回实际成功的小时和数量
+        根据 Dashboard 表格的状态判断
+        """
+        await self.page.goto("https://hpaportal.com.au/HPAPB/TAS/Appointments/BookingDashboard")
+        await asyncio.sleep(2)
+
+        success_hours = {}
+
+        for hour, requested in round_requests.items():
+            # 等待该小时的状态不再是 Pending（最多等待60秒）
+            max_wait_seconds = 60
+            waited = 0
+            status_text = ""
+
+            while waited < max_wait_seconds:
+                await self.page.reload()
+                await asyncio.sleep(3)
+                waited += 3
+
+                rows = await self.page.query_selector_all('tbody tr')
+                found = False
+
+                for row in rows:
+                    time_cell = await row.query_selector('td:nth-child(2)')
+                    if time_cell:
+                        time_text = await time_cell.inner_text()
+                        match = re.search(r'(\d{2}):(\d{2})', time_text)
+                        if match:
+                            row_hour = int(match.group(1))
+                            if row_hour == hour:
+                                found = True
+                                status_cell = await row.query_selector('td:nth-child(6) span')
+                                if status_cell:
+                                    status_text = await status_cell.inner_text()
+
+                                    if "Pending" in status_text:
+                                        self.log_console(f"⏳ 小时{hour:02d}: 状态为 Pending，等待3秒...")
+                                        break
+                                    else:
+                                        req_cell = await row.query_selector('td:nth-child(3) span')
+                                        book_cell = await row.query_selector('td:nth-child(4) span')
+
+                                        req_val = int((await req_cell.inner_text()).strip() or 0) if req_cell else 0
+                                        book_val = int((await book_cell.inner_text()).strip() or 0) if book_cell else 0
+
+                                        if "Processed" in status_text:
+                                            if req_val >= requested:
+                                                success_hours[hour] = requested
+                                                self.log_console(f"✅ 小时{hour:02d}: Processed - 成功预定{requested}个")
+                                            elif req_val > 0:
+                                                success_hours[hour] = req_val
+                                                self.log_console(f"⚠️ 小时{hour:02d}: Processed - 部分成功，成功{req_val}/{requested}个")
+                                            else:
+                                                self.log_console(f"❌ 小时{hour:02d}: Processed - 全部失败")
+                                        elif "Rejected" in status_text:
+                                            if req_val >= requested:
+                                                success_hours[hour] = requested
+                                                self.log_console(f"✅ 小时{hour:02d}: Rejected - 但已成功{requested}个")
+                                            elif req_val > 0:
+                                                success_hours[hour] = req_val
+                                                self.log_console(f"⚠️ 小时{hour:02d}: Rejected - 部分成功，成功{req_val}/{requested}个")
+                                            else:
+                                                self.log_console(f"❌ 小时{hour:02d}: Rejected - 全部失败")
+                                        else:
+                                            if req_val >= requested:
+                                                success_hours[hour] = requested
+                                                self.log_console(f"✅ 小时{hour:02d}: 成功预定{requested}个")
+                                            elif req_val > 0:
+                                                success_hours[hour] = req_val
+                                                self.log_console(f"⚠️ 小时{hour:02d}: 部分成功，成功{req_val}/{requested}个")
+                                            else:
+                                                self.log_console(f"❌ 小时{hour:02d}: 预定失败")
+                                        break
+
+                if found and "Pending" not in status_text:
+                    break
+                elif not found:
+                    self.log_console(f"⏳ 小时{hour:02d}: 未找到记录，等待3秒...")
+
+            if waited >= max_wait_seconds:
+                self.log_console(f"⚠️ 小时{hour:02d}: 等待超时，停止任务")
+                self.state.is_running = False
+                self._stop_flag = True
+                self.log_system_gui("⏸️ 等待超时，任务已停止")
+                self.log_console("⏸️ 等待超时，任务已停止")
+                break
+
+        return success_hours
 
     async def _run_booking(self):
         round_num = 0
@@ -480,9 +515,8 @@ class BookingController:
             before = self.state.remaining_values.copy()
             need_total = sum(before.values())
 
-            # 检查页面是否就绪
-            if not await self._is_page_ready():
-                await self._refresh_page()
+            # 先刷新页面获取最新数据
+            await self._refresh_page()
 
             # 并发获取可用值
             hours_to_check = [h for h in before.keys() if before.get(h, 0) > 0]
@@ -505,7 +539,10 @@ class BookingController:
                         round_requests[hour] = fill
                         filled += fill
 
-            self.log_console(f"第{round_num}轮 | 本轮填写{len(round_requests)}个小时 | 共{filled}个")
+            booked_total = filled
+            remain_total = need_total - booked_total
+
+            self.log_console(f"第{round_num}轮 | 需要预定{need_total}个 | 实际预定{booked_total}个 | 剩余{remain_total}个")
 
             if filled > 0:
                 if await self._click_submit():
@@ -530,15 +567,11 @@ class BookingController:
                     # 返回预约页面，继续尝试所有剩余的小时
                     await self.page.goto("https://hpaportal.com.au/HPAPB/TAS/Appointments/Book")
                     await asyncio.sleep(0.5)
-                    continue  # 跳过刷新，直接进入下一轮
                 else:
                     self.log_console(f"❌ 第{round_num}轮提交失败")
             else:
                 # 无可用额度
                 self.log_console(f"第{round_num}轮 | 无可用额度")
-
-            # 刷新页面
-            await self._refresh_page()
 
             # 等待间隔
             await asyncio.sleep(self.state.refresh_interval)
